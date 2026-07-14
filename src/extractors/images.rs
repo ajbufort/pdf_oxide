@@ -1977,7 +1977,6 @@ pub fn expand_inline_image_dict(
             "IM" => "ImageMask",
             "I" => "Interpolate",
             "D" => "Decode",
-            "EF" => "EFontFile",
             "Intent" => "Intent",
             _ => &key,
         };
