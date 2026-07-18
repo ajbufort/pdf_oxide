@@ -151,3 +151,72 @@ fn filtering_preserves_the_requested_reading_order() {
         assert_eq!(count_report(&spans), 1, "{order:?}: duplicate must be gone");
     }
 }
+
+/// A one-page PDF (MediaBox 0 0 200 200) that draws "VISIBLE" on the page and
+/// "OFFPAGE" far above it (y=5000, way outside the MediaBox). Docs that reuse one
+/// big Form XObject across pages rely on a `W n` clip to hide such off-page text;
+/// the raw extractor does not honour `W n`, so the reading-order path must drop
+/// spans that lie entirely outside the MediaBox - as `extract_spans` already does.
+fn pdf_with_offpage_text() -> Vec<u8> {
+    let mut pdf = Vec::new();
+    let mut off: Vec<usize> = Vec::new();
+    pdf.extend_from_slice(b"%PDF-1.5\n");
+    off.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\n");
+    off.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\n");
+    off.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200]\n\
+           /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>\nendobj\n\n",
+    );
+    let content = b"BT /F1 12 Tf 50 100 Td (VISIBLE) Tj ET\n\
+                    BT /F1 12 Tf 50 5000 Td (OFFPAGE) Tj ET\n";
+    off.push(pdf.len());
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content);
+    pdf.extend_from_slice(b"\nendstream\nendobj\n\n");
+    off.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+           /Encoding /WinAnsiEncoding >>\nendobj\n\n",
+    );
+    let xref = pdf.len();
+    let mut x = String::from("xref\n0 6\n0000000000 65535 f \n");
+    for o in &off {
+        x.push_str(&format!("{o:010} 00000 n \n"));
+    }
+    pdf.extend_from_slice(x.as_bytes());
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n").as_bytes(),
+    );
+    pdf
+}
+
+/// The reading-order path drops text lying entirely outside the MediaBox, matching
+/// `extract_spans`. Before this, a doc reusing one big Form XObject emitted every
+/// page's worth of off-page spans (measured: ~5x a chart's visible labels).
+#[test]
+fn reading_order_drops_offpage_spans() {
+    let doc = PdfDocument::from_bytes(pdf_with_offpage_text()).expect("parse");
+    let texts: Vec<String> = doc
+        .extract_spans_filtered_with_reading_order(
+            0,
+            ReadingOrder::TopToBottom,
+            HashSet::new(),
+            HashSet::new(),
+        )
+        .expect("spans")
+        .into_iter()
+        .map(|s| s.text.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        texts.iter().any(|t| t.contains("VISIBLE")),
+        "on-page text must survive: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.contains("OFFPAGE")),
+        "off-MediaBox text must be dropped: {texts:?}"
+    );
+}
