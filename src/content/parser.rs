@@ -933,6 +933,34 @@ impl PrescanResult {
 ///
 /// Returns `None` if the forward scan fails, signaling the caller to fall back
 /// to full stream parsing.
+/// Whether `data` contains a standalone `cm` (concatenate-matrix) operator.
+///
+/// Boundary-checked so it does not match `cm` inside a number or a bare word.
+/// A `/cm` name or a `cm` inside a `(...)` string can still match, but a FALSE
+/// POSITIVE is harmless: it only routes the prescan to the always-correct
+/// forward CTM scan. The check exists purely to KEEP the backward fast path for
+/// genuinely transform-free streams. One SIMD `memchr` pass -> O(n), bounded.
+fn contains_cm_operator(data: &[u8]) -> bool {
+    fn is_boundary(b: u8) -> bool {
+        b.is_ascii_whitespace()
+            || matches!(b, b'(' | b')' | b'<' | b'>' | b'[' | b']' | b'{' | b'}' | b'/' | b'%')
+    }
+    let len = data.len();
+    let mut off = 0;
+    while let Some(rel) = memchr::memchr(b'c', &data[off..]) {
+        let pos = off + rel;
+        off = pos + 1;
+        if pos + 1 < len
+            && data[pos + 1] == b'm'
+            && (pos == 0 || is_boundary(data[pos - 1]))
+            && (pos + 2 >= len || is_boundary(data[pos + 2]))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn prescan_text_regions(data: &[u8]) -> Option<PrescanResult> {
     fn is_boundary(b: u8) -> bool {
         b.is_ascii_whitespace()
@@ -994,7 +1022,14 @@ fn prescan_text_regions(data: &[u8]) -> Option<PrescanResult> {
     // For each text position, scan backwards to find the nearest unmatched 'q'
     // to capture CTM state (cm operators between q and BT/Do).
     let mut regions: Vec<(usize, usize)> = Vec::new();
-    let mut needs_forward_ctm = false;
+    // The backward nearest-`q` scan stops at the INNERMOST unmatched `q`, so it
+    // drops any `cm` applied in an OUTER q-frame (or at page base before any
+    // `q`) - a shape Scribus/InDesign/CAD emit routinely
+    // (`q [outer positioning cm] q BT ... ET Q Q`). The text then lands
+    // off-MediaBox and is culled -> total text loss. The forward scan captures
+    // the FULL CTM, so route to it whenever the stream carries ANY `cm`; the
+    // backward fast path is correct only for identity-CTM (no-`cm`) streams.
+    let mut needs_forward_ctm = contains_cm_operator(data);
 
     for &tp in &text_positions {
         // Find region start: scan backwards for unmatched q
@@ -5109,6 +5144,76 @@ mod tests {
             "injected Cm should include outer 0.1x scaling, got: {:?}",
             cm_ops
         );
+    }
+
+    #[test]
+    fn test_prescan_captures_outer_frame_cm_when_bt_near_start() {
+        // The backward nearest-`q` scan stops at the INNERMOST unmatched `q`, so
+        // an outer-frame `cm` (here a 286,57 translate one q-frame up) is dropped
+        // even though it sits WITHIN the 4KB backward window and the BT is near
+        // the stream start (so the old `hit_limit` never fired). The text then
+        // renders at the wrong origin and is culled off-MediaBox - the
+        // Scribus/InDesign/CAD total-loss shape (cc_001671 pages 4/6). Because the
+        // stream carries a `cm`, the prescan must route to the forward CTM scan,
+        // which captures the outer translate.
+        let mut cs = Vec::new();
+        // Outer q-frame with the positioning translate the backward scan misses.
+        cs.extend_from_slice(b"q\n");
+        cs.extend_from_slice(b"1 0 0 1 286 57 cm\n");
+        // Inner q-frame + text, all within the first 4KB (hit_limit stays false).
+        cs.extend_from_slice(b"q\n");
+        cs.extend_from_slice(b"BT\n");
+        cs.extend_from_slice(b"/F1 12 Tf\n");
+        cs.extend_from_slice(b"(Test) Tj\n");
+        cs.extend_from_slice(b"ET\n");
+        cs.extend_from_slice(b"Q\n");
+        cs.extend_from_slice(b"Q\n");
+        // >256KB of path filler AFTER the text, so the prescan gate fires while
+        // the BT stays near the stream start (no `cm` in the filler).
+        for i in 0..13000u32 {
+            let line = format!(
+                "{}.0 {}.0 m {}.0 {}.0 l n\n",
+                i % 500,
+                (i * 7) % 500,
+                (i * 3) % 500,
+                (i * 11) % 500
+            );
+            cs.extend_from_slice(line.as_bytes());
+        }
+        assert!(cs.len() > 256 * 1024, "stream must exceed 256KB prescan threshold");
+
+        let mut ops = Vec::new();
+        parse_and_execute_text_only(&cs, |op| {
+            ops.push(op);
+            Ok(())
+        })
+        .unwrap();
+
+        // The injected Cm must carry the outer 286,57 translate.
+        let cm_ops: Vec<_> = ops
+            .iter()
+            .filter(|op| matches!(op, Operator::Cm { .. }))
+            .collect();
+        let has_translate = cm_ops.iter().any(|op| {
+            matches!(op, Operator::Cm { e, f, .. } if (*e - 286.0).abs() < 0.5 && (*f - 57.0).abs() < 0.5)
+        });
+        assert!(
+            has_translate,
+            "injected Cm must include the outer 286,57 translate, got: {:?}",
+            cm_ops
+        );
+    }
+
+    #[test]
+    fn test_contains_cm_operator() {
+        // Real `cm` operators are detected (various boundaries + end-of-data).
+        assert!(contains_cm_operator(b"q 1 0 0 1 5 5 cm Q"));
+        assert!(contains_cm_operator(b"1 0 0 1 5 5 cm\nBT"));
+        assert!(contains_cm_operator(b"0 0 0 1 5 5 cm"));
+        // Streams with no `cm` operator are not matched (backward fast path kept).
+        assert!(!contains_cm_operator(b"q Q BT (x) Tj ET"));
+        assert!(!contains_cm_operator(b"/Comment 1 scn")); // 'c' runs that are not `cm`
+        assert!(!contains_cm_operator(b"100 200 m 300 400 l n")); // path ops only
     }
 
     #[test]
