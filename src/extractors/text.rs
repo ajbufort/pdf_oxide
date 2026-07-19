@@ -3245,13 +3245,21 @@ impl<'doc> TextExtractor<'doc> {
             }
         }
 
-        // Gate 1: too little placed text -> decorative figure, suppress.
-        if placed_chars < MIN_PLACED_CHARS {
-            return false;
-        }
-        // Gate 2: placed text dominates the page -> whole-body placed, keep.
+        // Gate 1: placed text dominates the page (little or nothing outside it)
+        // -> the whole body was placed as one figure, keep it - EVEN when small.
+        // A one-page InDesign flyer/poster/marketing spread places its entire
+        // body inside a single `/PlacedPDF`; without this an all-placed short
+        // page is TOTAL-LOSS (0 tokens). MUST precede the small-figure gate: when
+        // there is no real body outside, a small placed region is the page, not a
+        // decoration. (other == 0 makes `0 < placed` true for any placed text.)
         if other_chars.saturating_mul(3) < placed_chars {
             return true;
+        }
+        // Gate 2: too little placed text ALONGSIDE a real outside body -> the
+        // placed region is a decorative figure / logo / caption, suppress. Safe
+        // only because Gate 1 already kept the whole-page-placed case above.
+        if placed_chars < MIN_PLACED_CHARS {
+            return false;
         }
         // Gate 3: placed text is substantial but the outside text is comparable
         // or larger. Keep it unless a majority of the placed words also appear
@@ -11139,6 +11147,23 @@ mod tests {
         assert!(
             !TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
             "a full-size placed DUPLICATE of the outside text must stay suppressed"
+        );
+    }
+
+    #[test]
+    fn test_placed_pdf_kept_when_small_but_whole_page() {
+        // A one-page InDesign flyer / poster / marketing spread places its ENTIRE
+        // (short) body inside a single /PlacedPDF, with NOTHING outside it. The
+        // body is well under MIN_PLACED_CHARS, so the small-figure gate would
+        // suppress it and lose the WHOLE page (total-loss, 0 tokens). Because the
+        // placed text dominates (nothing outside), it must be KEPT: the dominance
+        // gate has to win over the small-figure gate. (cc_00be05b5: ~462 placed
+        // chars, 0 outside, 102 words per poppler - was scoring content-F1 0.0.)
+        let placed = "(New spring collection now open daily ten to six visit us) Tj\n".repeat(8);
+        let stream = format!("/OC /MC0 BDC\n/PlacedPDF BMC\nBT\n{placed}ET\nEMC\nEMC\n");
+        assert!(
+            TextExtractor::placed_pdf_text_dominates(stream.as_bytes()),
+            "a small whole-page /PlacedPDF body (nothing outside) must be KEPT, not suppressed"
         );
     }
 
